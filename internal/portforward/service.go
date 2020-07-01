@@ -175,58 +175,51 @@ func (s *Service) validateCreateRequest(r CreateRequest) error {
 	return nil
 }
 
-// resolvePod attempts to resolve a port forward request into an active pod we can
-// forward to. Service/deployments selectors will be resolved into pods and a random
-// one will be chosen. A pod has to be active.
-// Returns: pod name or error.
-func (s *Service) resolvePod(ctx context.Context, r CreateRequest) (string, error) {
-	o := s.opts.ObjectStore
-	if o == nil {
-		return "", errors.New("nil objectstore")
-	}
-
-	switch {
-	case r.APIVersion == "v1" && r.Kind == "Pod":
-		// Verify pod exists and status is running
-		if ok, err := s.verifyPod(ctx, r.Namespace, r.Name); !ok || err != nil {
-			return "", errors.Errorf("verifying pod %q: %v", r.Name, err)
-		}
-		return r.Name, nil
-	default:
-		return "", errors.New("not implemented")
-	}
-
-}
-
-// verifyPod returns true if the specified pod can be found and is in the running phase.
+// verifyObject returns true if the specified pod can be found and is in the running phase.
 // Otherwise returns false and an error describing the cause.
-func (s *Service) verifyPod(ctx context.Context, namespace, name string) (bool, error) {
+func (s *Service) verifyObject(ctx context.Context, r CreateRequest) (bool, error) {
 	o := s.opts.ObjectStore
 	if o == nil {
 		return false, errors.New("nil objectstore")
 	}
 
 	key := store.Key{
-		APIVersion: "v1",
-		Kind:       "Pod",
-		Namespace:  namespace,
-		Name:       name,
+		APIVersion: r.APIVersion,
+		Kind:       r.Kind,
+		Namespace:  r.Namespace,
+		Name:       r.Name,
 	}
-	var pod corev1.Pod
-	found, err := store.GetAs(ctx, o, key, &pod)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, nil
-	}
+	switch r.Kind {
+	case "Pod":
+		var pod corev1.Pod
+		found, err := store.GetAs(ctx, o, key, &pod)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
 
-	if pod.Name == "" {
-		return false, errors.New("pod not found")
-	}
+		if pod.Name == "" {
+			return false, errors.New("pod not found")
+		}
 
-	if pod.Status.Phase != corev1.PodRunning {
-		return false, errors.Errorf("pod not running, phase=%v", pod.Status.Phase)
+		if pod.Status.Phase != corev1.PodRunning {
+			return false, errors.Errorf("pod not running, phase=%v", pod.Status.Phase)
+		}
+	case "Service":
+		var service corev1.Service
+		found, err := store.GetAs(ctx, o, key, &service)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
+
+		if service.Name == "" {
+			return false, errors.New("service not found")
+		}
 	}
 
 	return true, nil
@@ -407,7 +400,12 @@ func (s *Service) List(ctx context.Context) []State {
 	result := make([]State, 0, len(s.state.portForwards))
 	for i, pf := range s.state.portForwards {
 		targetPod := &pf.Pod
-		if verified, err := s.verifyPod(ctx, targetPod.Namespace, targetPod.Name); !verified || err != nil {
+		if verified, err := s.verifyObject(ctx, CreateRequest{
+			Namespace:  targetPod.Namespace,
+			Name:       targetPod.Name,
+			APIVersion: targetPod.GVK.Version,
+			Kind:       targetPod.GVK.Kind,
+		}); !verified || err != nil {
 			delete(s.state.portForwards, i)
 			continue
 		}
@@ -449,13 +447,13 @@ func (s *Service) Create(ctx context.Context, gvk schema.GroupVersionKind, name 
 		"name", req.Name,
 		"namespace", req.Namespace,
 	).Debugf("resolving pod from object")
-	podName, err := s.resolvePod(ctx, req)
+	objectValid, err := s.verifyObject(ctx, req)
 	if err != nil {
 		return emptyPortForwardResponse, errors.Wrap(err, "resolving pod")
 	}
-	logger.Debugf("resolved to pod %q", podName)
-	podReq := req
-	podReq.Name = podName
+	if !objectValid {
+		return emptyPortForwardResponse, errors.New("object not valid")
+	}
 
 	id, err := s.createForwarder(req)
 	if err != nil {
